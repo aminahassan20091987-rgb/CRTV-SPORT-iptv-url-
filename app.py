@@ -1,23 +1,24 @@
+import os
 import time
 import shutil
 import threading
 import subprocess
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from urllib.parse import unquote
 
-APP_NAME = "NovaBlade IPTV"
 HOST = "0.0.0.0"
-PORT = 8080
+PORT = int(os.environ.get("PORT", "8080"))
 
 BASE = Path("/tmp/novabladeiptv")
 SOURCE_FILE = Path("/app/source.txt")
 
-QUALITIES = {
-    "240p": {"height": 240, "bitrate": "350k"},
-    "360p": {"height": 360, "bitrate": "600k"},
-    "480p": {"height": 480, "bitrate": "1000k"},
-    "720p": {"height": 720, "bitrate": "2200k"},
-}
+QUALITIES = [
+    ("240p", 240, "350k"),
+    ("360p", 360, "600k"),
+    ("480p", 480, "1000k"),
+    ("720p", 720, "2200k"),
+]
 
 process = None
 process_lock = threading.Lock()
@@ -25,22 +26,27 @@ process_lock = threading.Lock()
 
 def read_source():
     if not SOURCE_FILE.exists():
-        raise RuntimeError(
-            "Fichier source.txt manquant. Ajoute la source HLS autorisée."
-        )
+        raise RuntimeError("Fichier source.txt manquant.")
 
-    source = SOURCE_FILE.read_text(encoding="utf-8").strip()
+    source = SOURCE_FILE.read_text(
+        encoding="utf-8-sig"
+    ).strip()
+
+    source = source.strip('"').strip("'").strip()
 
     if not source.startswith(("http://", "https://")):
-        raise RuntimeError("URL HTTP/HTTPS invalide dans source.txt.")
+        raise RuntimeError(
+            "URL invalide dans source.txt. "
+            f"Contenu lu : {source[:30]!r}"
+        )
 
     return source
 
 
-def build_command(source):
-    BASE.mkdir(parents=True, exist_ok=True)
+def make_command(source):
+    shutil.rmtree(BASE, ignore_errors=True)
 
-    for name in QUALITIES:
+    for name, _, _ in QUALITIES:
         (BASE / name).mkdir(parents=True, exist_ok=True)
 
     filters = (
@@ -51,7 +57,7 @@ def build_command(source):
         "[v3]scale=-2:720[v720]"
     )
 
-    command = [
+    cmd = [
         "ffmpeg",
         "-hide_banner",
         "-loglevel", "warning",
@@ -61,26 +67,21 @@ def build_command(source):
         "-filter_complex", filters,
     ]
 
-    for name, label in [
-        ("240p", "v240"),
-        ("360p", "v360"),
-        ("480p", "v480"),
-        ("720p", "v720"),
-    ]:
-        command.extend(["-map", f"[{label}]", "-map", "0:a:0?"])
+    for label in ("v240", "v360", "v480", "v720"):
+        cmd += ["-map", f"[{label}]", "-map", "0:a:0?"]
 
-    for index, (name, config) in enumerate(QUALITIES.items()):
-        command.extend([
-            f"-c:v:{index}", "libx264",
-            f"-b:v:{index}", config["bitrate"],
-            f"-preset:v:{index}", "ultrafast",
-            f"-g:v:{index}", "48",
-            f"-sc_threshold:v:{index}", "0",
-            f"-c:a:{index}", "aac",
-            f"-b:a:{index}", "96k",
-        ])
+    for i, (_, _, bitrate) in enumerate(QUALITIES):
+        cmd += [
+            f"-c:v:{i}", "libx264",
+            f"-b:v:{i}", bitrate,
+            f"-preset:v:{i}", "ultrafast",
+            f"-g:v:{i}", "48",
+            f"-sc_threshold:v:{i}", "0",
+            f"-c:a:{i}", "aac",
+            f"-b:a:{i}", "96k",
+        ]
 
-    command.extend([
+    cmd += [
         "-f", "hls",
         "-hls_time", "4",
         "-hls_list_size", "6",
@@ -94,27 +95,28 @@ def build_command(source):
         "-hls_segment_filename",
         str(BASE / "%v" / "segment_%06d.ts"),
         str(BASE / "%v" / "index.m3u8"),
-    ])
+    ]
 
-    return command
+    return cmd
 
 
-def supervise_stream():
+def supervise():
     global process
 
     while True:
         try:
             source = read_source()
-            command = build_command(source)
+            command = make_command(source)
 
-            print("NovaBlade : démarrage FFmpeg", flush=True)
+            print("Démarrage du flux FFmpeg...", flush=True)
 
             with process_lock:
                 process = subprocess.Popen(command)
 
-            code = process.wait()
+            exit_code = process.wait()
+
             print(
-                f"FFmpeg arrêté (code {code}). Nouvelle tentative dans 10 s.",
+                f"FFmpeg arrêté avec le code {exit_code}.",
                 flush=True,
             )
 
@@ -128,34 +130,52 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
 
+    def send_body(self, status, body, content_type):
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
     def do_GET(self):
-        path = self.path.split("?", 1)[0]
+        path = unquote(self.path.split("?", 1)[0])
 
         if path == "/healthz":
-            return self.reply(200, b"ok", "text/plain")
+            return self.send_body(
+                200, b"ok", "text/plain; charset=utf-8"
+            )
 
         if path == "/":
-            body = (
-                "NovaBlade IPTV\n"
-                "HLS service\n"
-                "Use /live/master.m3u8\n"
-            ).encode()
-            return self.reply(200, body, "text/plain")
+            return self.send_body(
+                200,
+                b"NovaBlade IPTV service is running",
+                "text/plain; charset=utf-8",
+            )
 
         if not path.startswith("/live/"):
-            return self.reply(404, b"Not found", "text/plain")
+            return self.send_body(
+                404, b"Not found", "text/plain; charset=utf-8"
+            )
 
         relative = path[len("/live/"):]
         target = (BASE / relative).resolve()
 
-        if not str(target).startswith(str(BASE.resolve()) + "/"):
-            return self.reply(403, b"Forbidden", "text/plain")
+        if not str(target).startswith(str(BASE.resolve()) + os.sep):
+            return self.send_body(
+                403, b"Forbidden", "text/plain; charset=utf-8"
+            )
 
         if not target.is_file():
-            return self.reply(
+            return self.send_body(
                 503,
                 b"Playlist or segment not ready",
-                "text/plain",
+                "text/plain; charset=utf-8",
             )
 
         content_type = (
@@ -165,37 +185,27 @@ class Handler(BaseHTTPRequestHandler):
         )
 
         try:
-            self.reply(200, target.read_bytes(), content_type)
-        except (BrokenPipeError, ConnectionResetError):
-            pass
+            self.send_body(200, target.read_bytes(), content_type)
+        except OSError as exc:
+            print(f"Erreur de lecture du fichier HLS : {exc}", flush=True)
 
-    def reply(self, status, data, content_type):
-        self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-
-        try:
-            self.wfile.write(data)
-        except (BrokenPipeError, ConnectionResetError):
-            pass
+    def do_HEAD(self):
+        self.send_body(200, b"", "text/plain; charset=utf-8")
 
 
 if __name__ == "__main__":
     if not shutil.which("ffmpeg"):
         raise RuntimeError("FFmpeg n'est pas installé.")
 
-    threading.Thread(
-        target=supervise_stream,
-        daemon=True,
-    ).start()
+    threading.Thread(target=supervise, daemon=True).start()
 
     server = ThreadingHTTPServer((HOST, PORT), Handler)
-    print(f"{APP_NAME} prêt sur le port {PORT}", flush=True)
+    print(f"NovaBlade IPTV écoute sur {PORT}", flush=True)
 
     try:
         server.serve_forever()
     finally:
         server.server_close()
+        with process_lock:
+            if process and process.poll() is None:
+                process.terminate()
