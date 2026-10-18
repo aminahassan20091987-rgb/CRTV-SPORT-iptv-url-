@@ -5,6 +5,10 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+
 COPY app.py .
+COPY source.txt .
+
+EXPOSE 8080
 
 CMD ["python", "-u", "app.py"]
